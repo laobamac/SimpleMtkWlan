@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  contents.xcworkspacedata
+  SimpleMtkWlan
+
+  Created by laobamac (王孝慈) on 2026/4/21.
+  Copyright © 2026 laobamac (王孝慈). All rights reserved.
+-->
+<Workspace
+   version = "1.0">
+   <FileRef
+      location = "self:">
+   </FileRef>
+</Workspace>
