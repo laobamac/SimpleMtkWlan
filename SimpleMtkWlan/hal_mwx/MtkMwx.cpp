@@ -5233,13 +5233,12 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		m->m_pkthdr.csum_flags = M_IPV4_CSUM_IN_OK |
 		    M_TCP_CSUM_IN_OK | M_UDP_CSUM_IN_OK;
 	}
+#endif
 
 	if ((rxd1 & MT_RXD1_NORMAL_SEC_MODE_MASK) != 0 &&
 	    !(rxd1 & (MT_RXD1_NORMAL_CLM | MT_RXD1_NORMAL_CM))) {
-		rxi->rxi_flags |= IEEE80211_RXI_HWDEC |
-		    IEEE80211_RXI_HWDEC_IV_STRIPPED;
+		rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
 	}
-#endif
 
 	remove_pad = (rxd2 & MT_RXD2_NORMAL_HDR_OFFSET_MASK) >>
 	    MT_RXD2_NORMAL_HDR_OFFSET_SHIFT;
@@ -5529,6 +5528,18 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	status->qos_ctl = qos_ctl;
 #endif
 	rxi->rxi_chan = chfnum;
+
+	if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
+		/*
+		 * MT7921/MT7922 firmware decrypts and removes CCMP IV/MIC.
+		 * Leave the protected bit clear so net80211 does not try to
+		 * strip an IV which is no longer present.
+		 */
+		struct ieee80211_frame *wh;
+
+		wh = mtod(m, struct ieee80211_frame *);
+		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
+	}
 
 	return 0;
 }
