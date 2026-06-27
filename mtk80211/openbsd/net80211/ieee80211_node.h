@@ -75,6 +75,14 @@ extern const struct ieee80211_rateset ieee80211_std_rateset_11a;
 extern const struct ieee80211_rateset ieee80211_std_rateset_11b;
 extern const struct ieee80211_rateset ieee80211_std_rateset_11g;
 
+struct ieee80211_node_switch_bss_arg {
+	u_int8_t	cur_macaddr[IEEE80211_ADDR_LEN];
+	u_int8_t	sel_macaddr[IEEE80211_ADDR_LEN];
+};
+
+void ieee80211_node_switch_bss(struct ieee80211com *,
+    struct ieee80211_node *);
+
 /* Index into ieee80211_std_rateset_11n[] array. */
 #define IEEE80211_HT_RATESET_SISO	0
 #define IEEE80211_HT_RATESET_SISO_SGI	1

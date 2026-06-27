@@ -444,6 +444,9 @@ struct ieee80211com {
 				    struct ieee80211_node *, u_int8_t);
 	void			(*ic_updateprot)(struct ieee80211com *);
 	int			(*ic_bgscan_start)(struct ieee80211com *);
+	void			(*ic_bgscan_done)(struct ieee80211com *,
+				    struct ieee80211_node_switch_bss_arg *,
+				    size_t);
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);

@@ -1188,11 +1188,6 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
     return fail;
 }
 
-struct ieee80211_node_switch_bss_arg {
-    u_int8_t cur_macaddr[IEEE80211_ADDR_LEN];
-    u_int8_t sel_macaddr[IEEE80211_ADDR_LEN];
-};
-
 /* Implements ni->ni_unref_cb(). */
 void
 ieee80211_node_switch_bss(struct ieee80211com *ic, struct ieee80211_node *ni)
@@ -1567,6 +1562,10 @@ ieee80211_end_scan(struct _ifnet *ifp)
          */
         IEEE80211_ADDR_COPY(arg->cur_macaddr, curbs->ni_macaddr);
         IEEE80211_ADDR_COPY(arg->sel_macaddr, selbs->ni_macaddr);
+        if (ic->ic_bgscan_done != NULL) {
+            (*ic->ic_bgscan_done)(ic, arg, sizeof(*arg));
+            return;
+        }
         ic->ic_bss->ni_unref_arg = arg;
         ic->ic_bss->ni_unref_arg_size = sizeof(*arg);
         ic->ic_bss->ni_unref_cb = ieee80211_node_switch_bss;
