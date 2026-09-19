@@ -150,7 +150,11 @@ config_mountroot(struct device *self, void (*fn)(struct device *))
 	fn(self);
 }
 
-static inline void delay(int usec) { IOSleep((usec + 999) / 1000); }
+static inline void delay(int usec) {
+    if (usec <= 0) return;
+    if (usec < 1000) IODelay(usec);
+    else IOSleep((usec + 999) / 1000);
+}
 
 static inline struct mbuf *
 m_pullup(struct mbuf *m, size_t len)
@@ -400,6 +404,7 @@ struct mwx_softc {
 #define MWX_FLAG_BGSCAN			0x02
 	int			sc_coredump_cnt;
 	int8_t			sc_resetting;
+	bool sc_detaching, sc_net_attached;
 	int8_t			sc_fw_loaded;
 
 	enum ieee80211_state	sc_ns_state;
@@ -689,6 +694,8 @@ void		mt7921_mac_write_txwi(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_node *, struct mt76_txwi *);
 void		mwx_mac_tx_free(struct mwx_softc *, struct mbuf *);
 int		mt7921_set_channel(struct mwx_softc *);
+int mt7921_mcu_set_associated_bss(struct mwx_softc *, int);
+int mt7921_mcu_set_associated_peer(struct mwx_softc *);
 
 uint8_t		 mt7921_get_phy_mode_v2(struct mwx_softc *,
 		    struct ieee80211_node *);
@@ -947,9 +954,9 @@ mwx_stop(struct ifnet *ifp)
 		task_del(sc->sc_nswq, &sc->sc_newstate_task);
 		task_del(sc->sc_nswq, &sc->sc_bgscan_done_task);
 		task_del(sc->sc_nswq, &sc->sc_setkey_task);
-		task_del(sc->sc_nswq, &sc->sc_scan_task);
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
 	}
+	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
 
 	ifp->if_timer = 0;
@@ -1037,8 +1044,11 @@ mwx_start(struct ifnet *ifp)
 		if (ic->ic_rawbpf != NULL)
 			bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_OUT);
 #endif
-		if (mwx_tx(sc, m, ni) != 0) {
-			ieee80211_release_node(ic, ni);
+		int rv = mwx_tx(sc, m, ni);
+		/* mwx_tx copies node metadata into the descriptor; completion uses
+		 * the packet/token only, so release the enqueue reference here. */
+		ieee80211_release_node(ic, ni);
+		if (rv != 0) {
 			ifp->if_oerrors++;
 			continue;
 		}
@@ -1291,6 +1301,11 @@ mwx_newstate_task(void *ptr)
 
 		mt7921_mcu_hw_scan_cancel(sc);
 		mwx_mcu_set_deep_sleep(sc, 0);
+		rv = mt7921_mcu_set_associated_bss(sc, 1);
+		if (!rv)
+			rv = mt7921_mcu_set_associated_peer(sc);
+		if (rv)
+			break;
 		mt7921_mcu_set_rts_thresh(sc, 0x92b, 0);
 		break;
 	}
@@ -1480,16 +1495,22 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	struct mt76_txwi *txp;
 	int rv;
 
-	if ((mt = mwx_txwi_get(sc)) == NULL)
+	if ((mt = mwx_txwi_get(sc)) == NULL) {
+		m_freem(m);
 		return ENOBUFS;
+	}
 	/* XXX DMA memory access without BUS_DMASYNC_PREWRITE */
 	txp = mt->mt_desc;
 	memset(txp, 0, sizeof(*txp));
 	mt7921_mac_write_txwi(sc, m, ni, txp);
 
 	rv = mwx_txwi_enqueue(sc, mt, m);
-	if (rv != 0)
+	if (rv != 0) {
+		/* Mapping failed before ownership reached the TXWI. */
+		m_freem(m);
+		mwx_txwi_put(sc, mt);
 		return rv;
+	}
 
 	static uint32_t tx_log_count;
 	if (tx_log_count < 32) {
@@ -1507,7 +1528,10 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 		tx_log_count++;
 	}
 
-	return mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
+	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
+	if (rv != 0)
+		mwx_txwi_put(sc, mt);
+	return rv;
 }
 
 void
@@ -1802,7 +1826,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	    pci_intr_map_msi(pa, &ih) &&
 	    pci_intr_map(pa, &ih)) {
 		printf("%s: can't map interrupt\n", DEVNAME(sc));
-		bus_space_unmap(sc->sc_st, sc->sc_memh, sc->sc_mems);
+		/* HAL detach owns the mapping on failure. */
 		return false;
 	}
 	MWX_DEV_LOG(sc, "attach interrupt mapped source=%s\n",
@@ -1833,6 +1857,10 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	sc->sc_ih = pci_intr_establish(pa->pa_pc, ih, IPL_NET,
 	    mwx_intr, sc, DEVNAME(sc));
+	if (sc->sc_ih == NULL) {
+		printf("%s: can't establish interrupt\n", DEVNAME(sc));
+		goto fail;
+	}
 	MWX_DEV_LOG(sc, "attach interrupt established handle=%p\n",
 	    (void *)sc->sc_ih);
 
@@ -1913,6 +1941,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	if_attach(ifp);
 	ieee80211_ifattach(ifp, gMwxHal->mwxController());
+	sc->sc_net_attached = true;
 	ieee80211_media_init(ifp);
 	MWX_DEV_LOG(sc, "attach net80211 attached caps=0x%x max_aid=%u\n",
 	    ic->ic_caps, ic->ic_max_aid);
@@ -1958,17 +1987,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	return true;
 
 fail:
-	MWX_DEV_LOG(sc, "attach failed; cleaning resources\n");
-	if (sc->sc_nswq != NULL) {
-		taskq_destroy(sc->sc_nswq);
-		sc->sc_nswq = NULL;
-	}
-	timeout_free(&sc->sc_reset_to);
-	mwx_txwi_free(sc);
-	mwx_dma_free(sc);
-	if (sc->sc_ih != NULL)
-		pci_intr_disestablish(pa->pa_pc, sc->sc_ih);
-	bus_space_unmap(sc->sc_st, sc->sc_memh, sc->sc_mems);
+	/* The HAL caller owns partial-attach cleanup through detach(). */
 	return false;
 }
 
@@ -1994,7 +2013,7 @@ struct cfattach mwx_ca = {
 void
 mwx_reset(struct mwx_softc *sc)
 {
-	if (sc->sc_resetting)
+	if (sc->sc_resetting || sc->sc_detaching)
 		return;
 	sc->sc_resetting = 1;
 	task_add(sc->sc_nswq, &sc->sc_reset_task);
@@ -4279,6 +4298,8 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	if (m == NULL)
 		return ENOMEM;
 	req = mtod(m, struct mt76_connac_hw_scan_req *);
+	/* The mbuf payload is not initialized by allocation. */
+	memset(req, 0, sizeof(*req));
 
 	sc->sc_flags |= MWX_FLAG_SCANNING;
 	sc->sc_scan_seq_num = (sc->sc_scan_seq_num + 1) & 0x7f;
@@ -5802,6 +5823,10 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 
 	mwx_dma_tx_cleanup(sc, &sc->sc_txq);
 
+	/* Both the event header and each PAIR/MSDU word must be present. */
+	if (mbuf_pkthdr_len(m) < 2 * sizeof(txval))
+		goto out;
+
 	if ((m = m_pullup(m, mbuf_pkthdr_len(m))) == NULL)
 		return;
 
@@ -5818,6 +5843,9 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 	for (i = 0; i < count; i++) {
 		uint16_t msdu;
 
+		/* PAIR words extend count, but never the received payload. */
+		if ((size_t)i >= mbuf_len(m) / sizeof(*txfree))
+			break;
 		txval = le32toh(txfree[i]);
 		if (txval & MT_TX_FREE_PAIR) {
 			count++;
@@ -6439,8 +6467,12 @@ MtkMwx::attach(IOPCIDevice *device)
 	MWX_LOG("HAL attach allocated com=%p pci=%p\n",
 	    (void *)com, (void *)pci);
 
+	if (!taskq_init()) {
+		releaseAll();
+		return false;
+	}
+	taskQueueOwned = true;
 	gMwxHal = this;
-	taskq_init();
 	pci->pa_tag = device;
 	pci->workloop = getMainWorkLoop();
 	pci->pa_id = ((pcireg_t)device->configRead16(kIOPCIConfigDeviceID) << 16) |
@@ -6460,30 +6492,44 @@ MtkMwx::attach(IOPCIDevice *device)
 void
 MtkMwx::detach(IOPCIDevice *device)
 {
-	MWX_LOG("HAL detach begin device=%p com=%p\n",
-	    (void *)device, (void *)com);
-	if (com == NULL) {
-		releaseAll();
-		return;
-	}
-
-	struct ifnet *ifp = &com->sc_ic.ic_if;
-	if (ifp->if_flags & IFF_RUNNING)
-		mwx_stop(ifp);
-
-	task_del(systq, &com->sc_reset_task);
-	task_del(systq, &com->sc_scan_task);
-	ieee80211_ifdetach(ifp);
-	mwx_txwi_free(com);
-	mwx_dma_free(com);
-	if (com->sc_ih) {
-		pci_intr_disestablish(pci->pa_pc, com->sc_ih);
-		com->sc_ih = NULL;
-	}
-	if (com->sc_memh)
-		bus_space_unmap(com->sc_st, com->sc_memh, com->sc_mems);
-	releaseAll();
-	MWX_LOG("HAL detach complete\n");
+    MWX_LOG("HAL detach begin device=%p com=%p\n", (void *)device, (void *)com);
+    if (com == NULL) {
+        if (taskQueueOwned) { taskq_destroy(systq); taskQueueOwned = false; }
+        releaseAll();
+        return;
+    }
+    struct ifnet *ifp = &com->sc_ic.ic_if;
+    com->sc_detaching = true;
+    timeout_del(&com->sc_reset_to);
+    /* Keep interrupts alive while in-flight MCU requests finish. */
+    taskq_quiesce(com->sc_nswq);
+    if (taskQueueOwned) taskq_quiesce(systq);
+    if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
+    timeout_free(&com->sc_reset_to);
+    /* No interrupt callback may access buffers during their destruction. */
+    if (com->sc_ih) {
+        pci_intr_disestablish(pci->pa_pc, com->sc_ih);
+        com->sc_ih = NULL;
+    }
+    if (com->sc_memh) {
+        mwx_write(com, MT_WFDMA0_HOST_INT_ENA, 0);
+        mwx_dma_disable(com, 1);
+    }
+    if (com->sc_net_attached) {
+        ieee80211_ifdetach(ifp);
+        com->sc_net_attached = false;
+    }
+    taskq_destroy(com->sc_nswq);
+    com->sc_nswq = NULL;
+    if (taskQueueOwned) { taskq_destroy(systq); taskQueueOwned = false; }
+    mwx_txwi_free(com);
+    mwx_dma_free(com);
+    if (com->sc_memh) {
+        bus_space_unmap(com->sc_st, com->sc_memh, com->sc_mems);
+        com->sc_memh = 0;
+    }
+    releaseAll();
+    MWX_LOG("HAL detach complete\n");
 }
 
 IOReturn
@@ -6661,3 +6707,108 @@ MtkMwx::free()
 		releaseAll();
 		MtkHalService::free();
 	}
+
+static int mwx_send_assoc_status(struct mwx_softc *sc, uint32_t cmd, void *data, size_t len)
+{
+    int seq, rv;
+    uint32_t status = 0;
+    rv = mwx_mcu_send_msg(sc, cmd, data, len, &seq);
+    if (rv) return rv;
+    rv = mwx_mcu_wait_resp_int(sc, cmd, seq, &status);
+    MWX_DEV_LOG(sc, "assoc_status cmd=%x transport=%d firmware=%u\n", cmd, rv, status);
+    return rv ? rv : (status ? EIO : 0);
+}
+
+/* Publish the associated peer without resetting WTBL or key state. */
+int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
+{
+    struct ieee80211_node *ni = sc->sc_ic.ic_bss;
+    if (!ni || IEEE80211_AID(ni->ni_associd) == 0) return EINVAL;
+    struct mbuf *m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+    if (!m) return ENOBUFS;
+    uint16_t tlvnum = 0;
+    mt7921_mcu_add_basic_tlv(m, &tlvnum, sc, ni, 1, 0);
+    struct sta_rec_state *state = (struct sta_rec_state *)mwx_append_tlv(m, &tlvnum, STA_REC_STATE, sizeof(*state));
+    state->state = 2; /* MT76_STA_INFO_STATE_ASSOC: NONE=0, AUTH=1, ASSOC=2. */
+    m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx, ((struct mwx_node *)ni)->wcid, tlvnum);
+    if (!m) return ENOBUFS;
+    int seq, rv = mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, &seq);
+    uint32_t status = 0;
+    if (!rv) rv = mwx_mcu_wait_resp_int(sc, MCU_UNI_CMD_STA_REC_UPDATE, seq, &status);
+    MWX_DEV_LOG(sc, "assoc_peer aid=%u state=2 transport=%d firmware=%u\n", IEEE80211_AID(ni->ni_associd), rv, status);
+    return rv ? rv : (status ? EIO : 0);
+}
+
+int
+mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	struct mwx_vif *mvif = &sc->sc_vif;
+	struct {
+		uint8_t bss_idx;
+		uint8_t pad[3];
+		struct mt76_connac_bss_basic_tlv basic;
+	} __packed bss = {};
+	struct {
+		uint8_t bss_idx;
+		uint8_t pad[3];
+		struct {
+			uint16_t tag, len;
+			uint8_t control_channel, center_chan, center_chan2, bw;
+			uint8_t tx_streams, rx_streams, short_st, ht_op_info;
+			uint8_t sco, band, pad[2];
+		} __packed rlm;
+	} __packed channel = {};
+	int rv, is_2g;
+
+	if (ic->ic_opmode != IEEE80211_M_STA)
+		return 0;
+	if (ni == NULL || ni->ni_chan == NULL ||
+	    ni->ni_chan == IEEE80211_CHAN_ANYC)
+		return EINVAL;
+	if (mt7921_mcu_chan_bw(ni->ni_chan) != CMD_CBW_20MHZ)
+		return EOPNOTSUPP;
+	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
+	bss.bss_idx = mvif->idx;
+	bss.basic.tag = htole16(UNI_BSS_INFO_BASIC);
+	bss.basic.len = htole16(sizeof(bss.basic));
+	bss.basic.active = 1;
+	bss.basic.omac_idx = mvif->omac_idx;
+	bss.basic.hw_bss_idx = mvif->omac_idx > EXT_BSSID_START ?
+	    HW_BSSID_0 : mvif->omac_idx;
+	bss.basic.band_idx = mvif->band_idx;
+	bss.basic.conn_type = htole32(STA_TYPE_STA | NETWORK_INFRA);
+	bss.basic.conn_state = associated ? 0 : 1;
+	bss.basic.wmm_idx = mvif->wmm_idx;
+	memcpy(bss.basic.bssid, ni->ni_bssid, ETHER_ADDR_LEN);
+	bss.basic.bmc_tx_wlan_idx = htole16(mvif->vif_mn.wcid);
+	bss.basic.sta_idx = htole16(mvif->vif_mn.wcid);
+	bss.basic.bcn_interval = htole16(ni->ni_intval);
+	bss.basic.dtim_period = ni->ni_dtimperiod;
+	/* BSS phymode uses A/B/G bits; nonht_basic_phy uses PHY_TYPE bits. */
+	bss.basic.phymode = is_2g ? ((1U << 1) | (1U << 2)) : (1U << 0);
+	bss.basic.nonht_basic_phy = htole16(is_2g ?
+	    PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP : PHY_TYPE_BIT_OFDM);
+	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &bss, sizeof(bss));
+	MWX_DEV_LOG(sc, "associated BSS enable=%d channel=%u beacon=%u dtim=%u rv=%d\n",
+	    associated, ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0), ni->ni_intval, ni->ni_dtimperiod, rv);
+	if (rv != 0 || !associated)
+		return rv;
+
+	channel.bss_idx = mvif->idx;
+	channel.rlm.tag = htole16(UNI_BSS_INFO_RLM);
+	channel.rlm.len = htole16(sizeof(channel.rlm));
+	channel.rlm.control_channel = ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0);
+	channel.rlm.center_chan = channel.rlm.control_channel;
+	channel.rlm.bw = CMD_CBW_20MHZ;
+	channel.rlm.tx_streams = sc->sc_capa.num_streams;
+	channel.rlm.rx_streams = sc->sc_capa.antenna_mask;
+	channel.rlm.short_st = 1;
+	channel.rlm.band = is_2g ? 0 : 1;
+	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
+	    &channel, sizeof(channel));
+	MWX_DEV_LOG(sc, "associated BSS RLM channel=%u band=%u rv=%d\n",
+	    channel.rlm.control_channel, channel.rlm.band, rv);
+	return rv;
+}

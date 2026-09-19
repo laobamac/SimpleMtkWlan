@@ -58,6 +58,7 @@ public:
 private:
     void releaseAll();
 
+    bool taskQueueOwned;
     struct mwx_softc *com;
     struct pci_attach_args *pci;
 };

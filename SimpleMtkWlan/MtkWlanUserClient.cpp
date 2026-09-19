@@ -91,7 +91,7 @@ IOReturn MtkWlanUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
     bool isSet = selector & IOCTL_MASK;
     selector &= ~IOCTL_MASK;
 //    IOLog("externalMethod invoke. selector=0x%X isSet=%d\n", selector, isSet);
-    if (selector < 0 || selector > IOCTL_ID_MAX) {
+    if (selector >= IOCTL_ID_MAX) {
         return super::externalMethod(selector, arguments, NULL, this, NULL);
     }
     void *data = isSet ? (void *)arguments->structureInput : (void *)arguments->structureOutput;

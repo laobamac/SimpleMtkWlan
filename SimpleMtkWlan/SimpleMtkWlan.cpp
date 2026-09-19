@@ -124,7 +124,14 @@ bool SimpleMtkWlan::configureInterface(IONetworkInterface *netif)
     ether_ifattach(ifp, OSDynamicCast(IOEthernetInterface, netif));
     fpNetStats->collisions = 0;
 #ifdef __PRIVATE_SPI__
-    netif->configureOutputPullModel(fHalService->getDriverInfo()->getTxQueueSize(), 0, 0, IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0);
+    // TXWI freelist and DMA rings are also accessed by interrupt events on
+    // this work loop. The default pull thread is not serialized with them.
+    if (netif->configureOutputPullModel(
+            fHalService->getDriverInfo()->getTxQueueSize(),
+            kIONetworkWorkLoopSynchronous, 0,
+            IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0)
+            != kIOReturnSuccess)
+        return false;
 #endif
     
     return true;
@@ -465,11 +472,20 @@ IOReturn SimpleMtkWlan::selectMedium(const IONetworkMedium *medium) {
 void SimpleMtkWlan::stop(IOService *provider)
 {
     XYLog("%s\n", __FUNCTION__);
+    if (fWatchdogWorkLoop && watchdogTimer) {
+        watchdogTimer->cancelTimeout();
+        watchdogTimer->disable();
+        fWatchdogWorkLoop->removeEventSource(watchdogTimer);
+        watchdogTimer->release();
+        watchdogTimer = NULL;
+        fWatchdogWorkLoop->release();
+        fWatchdogWorkLoop = NULL;
+    }
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     super::stop(provider);
     setLinkStatus(kIONetworkLinkValid);
-    fHalService->detach(pciNub);
     ether_ifdetach(ifp);
+    fHalService->detach(pciNub);
     detachInterface(fNetIf, true);
     OSSafeReleaseNULL(fNetIf);
     releaseAll();
