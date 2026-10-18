@@ -46,7 +46,9 @@ static IOReturn _if_input(OSObject *target, void *arg0, void *arg1, void *arg2, 
     struct _ifnet *ifq = (struct _ifnet *)arg0;
     struct mbuf_list *ml = (struct mbuf_list *)arg1;
     
-    MBUF_LIST_FOREACH(ml, m) {
+    /* Detach before transferring ownership. IOKit requires nextpkt == NULL,
+     * and the driver must not walk a packet after inputPacket consumes it. */
+    while ((m = ml_dequeue(ml)) != NULL) {
         if (ifq->iface == NULL) {
             panic("%s ifq->iface == NULL!!!\n", __FUNCTION__);
             break;

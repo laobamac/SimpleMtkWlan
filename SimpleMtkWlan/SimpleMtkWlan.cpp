@@ -20,6 +20,7 @@
 * GNU General Public License for more details.
 */
 #include "SimpleMtkWlan.hpp"
+#include "MtkLog.hpp"
 #include <linux/types.h>
 #include <linux/kernel.h>
 
@@ -34,6 +35,7 @@
 #define super IOEthernetController
 OSDefineMetaClassAndStructors(SimpleMtkWlan, IOEthernetController)
 OSDefineMetaClassAndStructors(CTimeout, OSObject)
+
 
 IOWorkLoop *_fWorkloop;
 IOCommandGate *_fCommandGate;
@@ -50,7 +52,7 @@ bool SimpleMtkWlan::init(OSDictionary *properties)
 #define  PCI_MSIX_FLAGS_ENABLE    0x8000    /* MSI-X enable */
 #define  PCI_MSI_FLAGS_ENABLE    0x0001    /* MSI feature enabled */
 
-static void pciMsiSetEnable(IOPCIDevice *device, UInt8 msiCap, int enable)
+static void __unused pciMsiSetEnable(IOPCIDevice *device, UInt8 msiCap, int enable)
 {
     u16 control;
     
@@ -73,6 +75,16 @@ static void pciMsiXClearAndSet(IOPCIDevice *device, UInt8 msixCap, UInt16 clear,
 
 IOService* SimpleMtkWlan::probe(IOService *provider, SInt32 *score)
 {
+    mtk_dbg_set_nub(provider);
+    XYLog("probe begin provider=%s\n", provider ? provider->getName() : "NULL");
+    IOService *ret = probeImpl(provider, score);
+    XYLog("probe end ret=%p\n", (void *)ret);
+    mtk_dbg_publish();
+    return ret;
+}
+
+IOService* SimpleMtkWlan::probeImpl(IOService *provider, SInt32 *score)
+{
     bool isMatch = false;
     super::probe(provider, score);
     UInt8 msiCap;
@@ -91,9 +103,12 @@ IOService* SimpleMtkWlan::probe(IOService *provider, SInt32 *score)
             pciMsiXClearAndSet(device, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);
         }
         device->findPCICapability(PCI_CAP_ID_MSI, &msiCap);
-        if (msiCap) {
-            pciMsiSetEnable(device, msiCap, 1);
-        }
+        /*
+         * Do not set the MSI enable bit by hand: nothing has programmed the
+         * MSI address/data yet, and with MSI enabled the device stops raising
+         * INTx. IOPCIFamily enables MSI when the PCIMessaged vector is
+         * registered (see pci_intr_establish).
+         */
         if (!msiCap && !msixCap) {
             XYLog("%s No MSI cap\n", __FUNCTION__);
             fHalService->release();
@@ -124,7 +139,14 @@ bool SimpleMtkWlan::configureInterface(IONetworkInterface *netif)
     ether_ifattach(ifp, OSDynamicCast(IOEthernetInterface, netif));
     fpNetStats->collisions = 0;
 #ifdef __PRIVATE_SPI__
-    netif->configureOutputPullModel(fHalService->getDriverInfo()->getTxQueueSize(), 0, 0, IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0);
+    // TXWI freelist and DMA rings are also accessed by interrupt events on
+    // this work loop. The default pull thread is not serialized with them.
+    if (netif->configureOutputPullModel(
+            fHalService->getDriverInfo()->getTxQueueSize(),
+            kIONetworkWorkLoopSynchronous, 0,
+            IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0)
+            != kIOReturnSuccess)
+        return false;
 #endif
     
     return true;
@@ -291,12 +313,24 @@ void SimpleMtkWlan::associateSSID(const char *ssid, const char *pwd)
 
 bool SimpleMtkWlan::start(IOService *provider)
 {
+    mtk_dbg_set_nub(provider);
+    XYLog("start begin\n");
+    bool ret = startImpl(provider);
+    XYLog("start end ret=%d\n", ret);
+    mtk_dbg_publish();
+    return ret;
+}
+
+bool SimpleMtkWlan::startImpl(IOService *provider)
+{
     int boot_value = 0;
     if (!super::start(provider)) {
+        XYLog("super::start failed\n");
         return false;
     }
     pciNub = OSDynamicCast(IOPCIDevice, provider);
     if (!pciNub) {
+        XYLog("provider is not IOPCIDevice\n");
         return false;
     }
     pciNub->setBusMasterEnable(true);
@@ -305,9 +339,11 @@ bool SimpleMtkWlan::start(IOService *provider)
     pciNub->configWrite8(0x41, 0);
     if (pciNub->requestPowerDomainState(kIOPMPowerOn,
                                         (IOPowerConnection *) getParentEntry(gIOPowerPlane), IOPMLowestState) != IOPMNoErr) {
+        XYLog("requestPowerDomainState failed\n");
         return false;
     }
     if (initPCIPowerManagment(pciNub) == false) {
+        XYLog("initPCIPowerManagment failed\n");
         super::stop(pciNub);
         return false;
     }
@@ -403,10 +439,24 @@ bool SimpleMtkWlan::start(IOService *provider)
     return true;
 }
 
+IOReturn SimpleMtkWlan::halDebugPollAction(void *, void *, void *, void *)
+{
+    if (fHalService != NULL)
+        fHalService->debugPoll();
+    return kIOReturnSuccess;
+}
+
 void SimpleMtkWlan::watchdogAction(IOTimerEventSource *timer)
 {
     struct _ifnet *ifp = getIfp();
     (*ifp->if_watchdog)(ifp);
+    if (_fCommandGate != NULL &&
+        _fCommandGate->attemptAction(OSMemberFunctionCast(IOCommandGate::Action,
+            this, &SimpleMtkWlan::halDebugPollAction)) != kIOReturnSuccess)
+        XYLog("watchdog: main work loop busy, poll skipped\n");
+    static int publishTick;
+    if (++publishTick % 5 == 0)
+        mtk_dbg_publish();
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
 }
 
@@ -464,12 +514,23 @@ IOReturn SimpleMtkWlan::selectMedium(const IONetworkMedium *medium) {
 
 void SimpleMtkWlan::stop(IOService *provider)
 {
+    XYLog("stop\n");
+    mtk_dbg_publish();
     XYLog("%s\n", __FUNCTION__);
+    if (fWatchdogWorkLoop && watchdogTimer) {
+        watchdogTimer->cancelTimeout();
+        watchdogTimer->disable();
+        fWatchdogWorkLoop->removeEventSource(watchdogTimer);
+        watchdogTimer->release();
+        watchdogTimer = NULL;
+        fWatchdogWorkLoop->release();
+        fWatchdogWorkLoop = NULL;
+    }
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     super::stop(provider);
     setLinkStatus(kIONetworkLinkValid);
-    fHalService->detach(pciNub);
     ether_ifdetach(ifp);
+    fHalService->detach(pciNub);
     detachInterface(fNetIf, true);
     OSSafeReleaseNULL(fNetIf);
     releaseAll();

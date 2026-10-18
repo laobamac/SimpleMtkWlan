@@ -51,10 +51,25 @@ public:
     virtual IOReturn disable(IONetworkInterface *interface) = 0;
     
     virtual struct ieee80211com *get80211Controller() = 0;
+#ifdef AIRPORT_WCL
+    /* Native Wi-Fi (AirportMtkWlan): off-channel time per channel macOS asks scans to use. */
+    virtual IOReturn setScanHomeAwayTime(uint32_t) { return kIOReturnUnsupported; }
+#endif
     
     virtual MtkDriverInfo *getDriverInfo() = 0;
     
     virtual MtkDriverController *getDriverController() = 0;
+    
+    /* Periodic hardware state dump / interrupt poll, called on the main work loop. */
+    virtual void debugPoll() {}
+
+    /*
+     * System sleep / wake, called on the main work loop by the front end's
+     * power state change. The card loses power in S3: suspend() quiets it,
+     * resume() takes it back and reloads the firmware.
+     */
+    virtual void suspend() {}
+    virtual void resume() {}
     
     virtual void free() override;
 

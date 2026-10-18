@@ -862,6 +862,9 @@ ieee80211_begin_scan(struct _ifnet *ifp)
 {
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
+#ifdef AIRPORT_WCL
+    ic->ic_wcl_scan_idle = false;
+#endif
     
     /*
      * In all but hostap mode scanning starts off in
@@ -912,6 +915,9 @@ ieee80211_next_scan(struct _ifnet *ifp)
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
     struct ieee80211_channel *chan;
     
+#ifdef AIRPORT_WCL
+    ic->ic_wcl_scan_idle = false;
+#endif
     chan = ic->ic_bss->ni_chan;
     for (;;) {
         if (++chan > &ic->ic_channels[IEEE80211_CHAN_MAX])
@@ -1063,6 +1069,10 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
     u_int8_t rate;
     int fail;
     
+#ifdef AIRPORT_WCL
+    if (!ic->ic_wcl_join_requested)
+        return IEEE80211_NODE_ASSOCFAIL_ESSID;
+#endif
     fail = 0;
     if ((ic->ic_flags & IEEE80211_F_BGSCAN) == 0 &&
         isclr(ic->ic_chan_active, ieee80211_chan2ieee(ic, ni->ni_chan)))
@@ -1380,7 +1390,13 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     if (selbs2 != NULL) {
         XYLog("%s 2ghz ssid=%s mac=%s rssi=%d\n", __FUNCTION__, selbs2->ni_essid, ether_sprintf(selbs2->ni_bssid), selbs2->ni_rssi);
     }
-    if (selbs5 && (*ic->ic_node_checkrssi)(ic, selbs5))
+    /*
+     * Also prefer 5 GHz when its signal is within 15 points of the best
+     * 2 GHz AP: the strict threshold picked a slightly stronger 2.4 GHz AP
+     * that was 3x slower in practice.
+     */
+    if (selbs5 && ((*ic->ic_node_checkrssi)(ic, selbs5) ||
+        selbs2 == NULL || selbs5->ni_rssi + 15 >= selbs2->ni_rssi))
         selbs = selbs5;
     else if (selbs5 && selbs2)
         selbs = (selbs5->ni_rssi >= selbs2->ni_rssi ? selbs5 : selbs2);
@@ -1465,6 +1481,18 @@ ieee80211_end_scan(struct _ifnet *ifp)
         }
 #endif
         if (ic->ic_state != IEEE80211_S_RUN) {
+#ifdef AIRPORT_WCL
+            /*
+             * macOS asks for every scan (and joins only what it picked), so
+             * do not sweep again on our own: a running sweep would make its
+             * next request wait for it. beginWCLScan/startWCLJoin restart.
+             */
+            if (!ic->ic_wcl_join_requested) {
+                ieee80211_reset_scan(ifp);
+                ic->ic_wcl_scan_idle = true;
+                return;
+            }
+#endif
             /*
              * Reset the list of channels to scan and scan the next mode
              * if nothing has been found.

@@ -118,10 +118,25 @@
 
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+void mtk_dbg_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#ifdef __cplusplus
+}
+#endif
+
+/* Which kext is talking: the native Wi-Fi build (AIRPORT) or the SimpleMTK one. */
+#ifdef AIRPORT
+#define MTK_LOG_NAME "AirportMtkWlan"
+#else
+#define MTK_LOG_NAME "SimpleMtkWlan"
+#endif
+
 #define XYLog(fmt, x...)\
 do\
 {\
-kprintf("%s: " fmt, "SimpleMtkWlan", ##x);\
+mtk_dbg_log("%s: " fmt, MTK_LOG_NAME, ##x);\
 }while(0)
 
 typedef UInt8  u8;

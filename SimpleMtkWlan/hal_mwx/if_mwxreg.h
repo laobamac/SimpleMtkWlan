@@ -1327,6 +1327,50 @@ struct sta_rec_ra_info {
 #define	RA_LEGACY_OFDM	0x3fc0
 #define	RA_LEGACY_CCK	0x000f
 
+#define	STA_REC_AMSDU			0x05
+#define	STA_REC_HW_AMSDU		0x0f
+struct sta_rec_amsdu {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		max_amsdu_num;
+	uint8_t		max_mpdu_size;
+	uint8_t		amsdu_en;
+	uint8_t		rsv;
+} __packed;
+
+#define	STA_REC_BA			0x06
+#define	MT_BA_TYPE_ORIGINATOR		1
+#define	MT_BA_TYPE_RECIPIENT		2
+struct sta_rec_ba {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		tid;
+	uint8_t		ba_type;
+	uint8_t		amsdu;
+	uint8_t		ba_en;
+	uint16_t	ssn;
+	uint16_t	winsize;
+} __packed;
+
+#define	STA_REC_VHT			0x0a
+struct sta_rec_vht_v1 {
+	uint16_t	tag;
+	uint16_t	len;
+	uint32_t	vht_cap;
+	uint16_t	vht_rx_mcs_map;
+	uint16_t	vht_tx_mcs_map;
+	uint8_t		rts_bw_sig;
+	uint8_t		rsv[3];
+} __packed;
+
+#define	STA_REC_HT			0x09
+struct sta_rec_ht_v1 {
+	uint16_t	tag;
+	uint16_t	len;
+	uint16_t	ht_cap;
+	uint16_t	rsv;
+} __packed;
+
 #define	STA_REC_STATE			0x07
 struct sta_rec_state {
 	uint16_t	tag;

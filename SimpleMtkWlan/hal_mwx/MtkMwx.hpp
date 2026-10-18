@@ -45,8 +45,13 @@ public:
     UInt32 supportedFeatures() override;
     const char *getFirmwareCountryCode() override;
     uint32_t getTxQueueSize() override;
+    uint32_t getRxRateKbps() override;
+    int getRxRateMcs() override;
 
     void clearScanningFlags() override;
+    void debugPoll() override;
+    void suspend() override;
+    void resume() override;
     IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
 
     static bool mwx_match(IOPCIDevice *device);
@@ -58,6 +63,7 @@ public:
 private:
     void releaseAll();
 
+    bool taskQueueOwned;
     struct mwx_softc *com;
     struct pci_attach_args *pci;
 };

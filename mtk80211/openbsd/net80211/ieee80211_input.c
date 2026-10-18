@@ -146,6 +146,7 @@ void    ieee80211_recv_action(struct ieee80211com *, mbuf_t,
 void    ieee80211_recv_pspoll(struct ieee80211com *, mbuf_t,
                               struct ieee80211_node *);
 #endif
+uint32_t ieee80211_bar_rx_count;
 void    ieee80211_recv_bar(struct ieee80211com *, mbuf_t,
                            struct ieee80211_node *);
 void    ieee80211_bar_tid(struct ieee80211com *, struct ieee80211_node *,
@@ -603,10 +604,30 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                         goto err;
                     }
                     /* do software decryption */
-                    m = ieee80211_decrypt(ic, m, ni);
-                    if (m == NULL) {
-                        ic->ic_stats.is_rx_wepfail++;
-                        goto err;
+                    {
+                        static uint32_t wepfail_log_count;
+                        int hdrlen = ieee80211_get_hdrlen(wh);
+                        int kid = -1, mcast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+                        if (mbuf_len(m) > (size_t)hdrlen + 3)
+                            kid = (mtod(m, uint8_t *)[hdrlen + 3] >> 6) & 3;
+                        m = ieee80211_decrypt(ic, m, ni);
+                        if (m == NULL) {
+                            ic->ic_stats.is_rx_wepfail++;
+                            if (wepfail_log_count < 48) {
+                                struct ieee80211_key *k = (kid >= 0) ?
+                                    &ic->ic_nw_keys[kid] : NULL;
+                                XYLog("wepfail kid=%d mcast=%d def_txkey=%d "
+                                    "key_cipher=%d key_flags=0x%x pairwise_cipher=%d "
+                                    "rxi_flags=0x%x\n", kid, mcast,
+                                    ic->ic_def_txkey,
+                                    k ? (int)k->k_cipher : -1,
+                                    k ? (unsigned)k->k_flags : 0,
+                                    (int)ni->ni_pairwise_key.k_cipher,
+                                    rxi->rxi_flags);
+                                wepfail_log_count++;
+                            }
+                            goto err;
+                        }
                     }
                 } else {
                     m = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
@@ -627,6 +648,10 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                 bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_IN);
 #endif
             
+#ifdef AIRPORT_WCL
+            if (ic->ic_opmode == IEEE80211_M_STA)
+                ++ic->ic_wcl_rx_packets[hasqos ? ieee80211_wcl_ac(tid) : EDCA_AC_BE];
+#endif
             if ((ni->ni_flags & IEEE80211_NODE_HT) &&
                 hasqos && (qos & IEEE80211_QOS_AMSDU))
                 ieee80211_amsdu_decap(ic, m, ni, hdrlen, ml);
@@ -1137,7 +1162,14 @@ ieee80211_enqueue_data(struct ieee80211com *ic, mbuf_t m,
             if (ifp->if_bpf && m1 == NULL)
                 bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_IN);
 #endif
-#ifdef USE_APPLE_SUPPLICANT
+#if defined(AIRPORT_WCL)
+            if (ic->ic_wcl_enterprise) {
+                mbuf_t eapCopy = NULL;
+                if (mbuf_dup(m, MBUF_DONTWAIT, &eapCopy) == 0 && eapCopy)
+                    ml_enqueue(ml, eapCopy);
+            }
+            ieee80211_eapol_key_input(ic, m, ni);
+#elif defined(USE_APPLE_SUPPLICANT)
             ml_enqueue(ml, m);
 #else
 #ifdef IO80211FAMILY_V2
@@ -2032,7 +2064,11 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         (ic->ic_flags & IEEE80211_F_BGSCAN)) {
         struct ieee80211_rsnparams rsn, wpa;
         
+#ifdef AIRPORT_WCL
+        uint32_t tlv_len = (mtod(m, u_int8_t *) + mbuf_len(m)) - (u_int8_t *)&wh[1] - 8 - 2 - 2;
+#else
         uint32_t tlv_len = (mtod(m, u_int8_t *) + mbuf_len(m)) - (u_int8_t *)&wh[1] + 1 - 8 - 2 - 2;
+#endif
         ieee80211_save_ie_tlv(((u_int8_t *)&wh[1]) + 8 + 2 + 2, &ni->ni_rsnie_tlv, &ni->ni_rsnie_tlv_len, tlv_len);
         ni->ni_rsnprotos = IEEE80211_PROTO_NONE;
         ni->ni_supported_rsnprotos = IEEE80211_PROTO_NONE;
@@ -2128,6 +2164,17 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     ni->ni_erp = erp;
     /* NB: must be after ni_chan is setup */
     ieee80211_setup_rates(ic, ni, rates, xrates, IEEE80211_F_DOSORT);
+#ifdef AIRPORT_WCL
+    if (ic->ic_event_handler) {
+        const uint8_t *ies = (const uint8_t *)&wh[1] + 12;
+        const uint8_t *end = mtod(m, const uint8_t *) + mbuf_len(m);
+        if (end >= ies) {
+            struct ieee80211_beacon_event event = {ni, ies, (size_t)(end - ies),
+                (const uint8_t *)wh, (size_t)(end - (const uint8_t *)wh)};
+            ic->ic_event_handler(ic, IEEE80211_EVT_BEACON, &event);
+        }
+    }
+#endif
 #ifndef IEEE80211_STA_ONLY
     if (ic->ic_opmode == IEEE80211_M_IBSS && is_new && isprobe) {
         /*
@@ -2952,7 +2999,13 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
                           ic->ic_state == IEEE80211_S_RUN);
             int roamscan = bgscan &&
                         (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
-            if (!roamscan) /* ignore disassoc during bgscan */
+            /*
+             * Ignore disassoc during bgscan, and while still
+             * authenticating: the AP sends one to drop a stale session
+             * of ours, and jumping to ASSOC there loses the pending
+             * auth response.
+             */
+            if (!roamscan && ic->ic_state >= IEEE80211_S_ASSOC)
                 ieee80211_new_state(ic, IEEE80211_S_ASSOC,
                                     IEEE80211_FC0_SUBTYPE_DISASSOC);
         }
@@ -3221,6 +3274,14 @@ ieee80211_recv_addba_resp(struct ieee80211com *ic, mbuf_t m,
         return;
     }
     
+    /*
+     * A-MSDU inside the A-MPDUs we send only if the recipient allows it
+     * (the bit in its ADDBA response); the driver reads it from ba_params.
+     */
+    ba->ba_params &= ~IEEE80211_ADDBA_AMSDU;
+    if (ic->ic_caps & IEEE80211_C_TX_AMSDU_IN_AMPDU)
+        ba->ba_params |= params & IEEE80211_ADDBA_AMSDU;
+
     /* notify drivers of this new Block Ack agreement */
     if (ic->ic_ampdu_tx_start != NULL)
         err = ic->ic_ampdu_tx_start(ic, ni, tid);
@@ -3577,6 +3638,7 @@ void
 ieee80211_recv_bar(struct ieee80211com *ic, mbuf_t m,
                    struct ieee80211_node *ni)
 {
+    ieee80211_bar_rx_count++;
     const struct ieee80211_frame_min *wh;
     const u_int8_t *frm;
     u_int16_t ctl, ssn;

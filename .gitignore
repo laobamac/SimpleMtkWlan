@@ -15,3 +15,10 @@ build/
 *.kext/
 *.zip
 *.tar.gz
+
+# Build output
+build/
+DerivedData/
+*.zip
+tests/scan/scan.cpp
+tests/scan/scan-test
