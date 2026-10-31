@@ -33,6 +33,20 @@ files.
   (王孝慈).
 - MediaTek MT7921/MT7922 attach, firmware load, DMA, scan, and TX/authentication path
   development continues in this repository.
+- Fork upkeep, build reproducibility, and stability work by ItzVyral (with
+  OpenCode), https://github.com/ItzVyral/SimpleMtkWlan.
+
+## Build-time Dependencies
+
+- **MacKernelSDK** — https://github.com/acidanthera/MacKernelSDK
+  macOS kernel headers (`libkern/`, `machine/`, kernel side of `IOKit`, ...)
+  and `libkmod.a`, distributed under the Apple Public Source License 2.0
+  (`LICENSE.txt` inside the submodule).
+  Taken: nothing is copied into this repository; the project compiles against
+  the headers through `KERNEL_EXTENSION_HEADER_SEARCH_PATHS` and links the
+  `libkmod.a` it ships. Present as a git submodule at `MacKernelSDK/`, build
+  only. Added 2026-10-31, pinned to commit
+  `3f750085caa17ec3a7880f11c11bf4f48cd6a164`.
 
 ## License Notes
 
